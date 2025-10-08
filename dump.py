@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Dump FeliCa system 0x0003 service information using nfcpy."""
+"""Dump FeliCa system service information using nfcpy."""
 
 from __future__ import annotations
 
@@ -22,7 +22,8 @@ from nfc.tag.tt3 import (
 )
 
 
-FELICA_SYSTEM_CODE = 0x0003
+DEFAULT_SYSTEM_CODE = 0x0003
+SYSTEM_CODE_WILDCARD = 0xFFFF
 DEFAULT_POLL_INTERVAL = 0.2  # seconds between sense attempts
 DEFAULT_POLL_TRIES = 0  # 0 => keep waiting forever
 MAX_SERVICE_NUMBER = 1 << 10  # 10-bit service number space
@@ -38,9 +39,23 @@ class ServiceInfo:
     key_version: Optional[int] = None
 
 
+def _parse_system_code(value: str) -> int:
+    try:
+        code = int(value, 0)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError(
+            f"invalid system code '{value}' (expected integer literal)"
+        ) from exc
+    if not 0 <= code <= 0xFFFF:
+        raise argparse.ArgumentTypeError("system code must be between 0x0000 and 0xFFFF")
+    return code
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Dump all FeliCa (system code 0x0003) services readable without keys."
+        description=(
+            "Dump all FeliCa services readable without keys (default system code 0x0003)."
+        )
     )
     parser.add_argument(
         "--device",
@@ -60,27 +75,42 @@ def parse_args() -> argparse.Namespace:
         default=DEFAULT_POLL_TRIES,
         help="Number of polling iterations before giving up (0 waits indefinitely).",
     )
+    parser.add_argument(
+        "--system-code",
+        type=_parse_system_code,
+        default=DEFAULT_SYSTEM_CODE,
+        help=(
+            "FeliCa system code to select (default: 0x0003). "
+            "Use 0xFFFF to request all systems reported by the card."
+        ),
+    )
     return parser.parse_args()
 
 
-def _build_sensf_req() -> bytearray:
-    """Create a SENSF_REQ payload that selects system code 0x0003."""
+def _build_sensf_req(system_code: int) -> bytearray:
+    """Create a SENSF_REQ payload that selects the target system code."""
     # Format: 0x00 + system code (big-endian) + request code + time slot.
-    return bytearray(b"\x00" + struct.pack(">HBB", FELICA_SYSTEM_CODE, 0x00, 0x00))
+    return bytearray(b"\x00" + struct.pack(">HBB", system_code, 0x00, 0x00))
 
 
-def _make_remote_target(bit_rate: str) -> nfc.clf.RemoteTarget:
+def _make_remote_target(bit_rate: str, system_code: int) -> nfc.clf.RemoteTarget:
     target = nfc.clf.RemoteTarget(bit_rate)
-    target.sensf_req = _build_sensf_req()
+    target.sensf_req = _build_sensf_req(system_code)
     return target
 
 
 def wait_for_felica_target(
-    clf: nfc.ContactlessFrontend, poll_tries: int, poll_interval: float
+    clf: nfc.ContactlessFrontend,
+    poll_tries: int,
+    poll_interval: float,
+    system_code: int,
 ) -> Optional[nfc.clf.RemoteTarget]:
     tries_remaining = poll_tries if poll_tries > 0 else None
     while tries_remaining is None or tries_remaining > 0:
-        targets = [_make_remote_target("212F"), _make_remote_target("424F")]
+        targets = [
+            _make_remote_target("212F", system_code),
+            _make_remote_target("424F", system_code),
+        ]
         target = clf.sense(*targets, iterations=1, interval=poll_interval)
         if target is not None:
             return target
@@ -89,17 +119,17 @@ def wait_for_felica_target(
     return None
 
 
-def select_system(tag: Type3Tag) -> Tuple[bytearray, bytearray, int]:
+def select_system(tag: Type3Tag, system_code: int) -> Tuple[bytearray, bytearray, int]:
     """Re-select the card for the target system code and return identifiers."""
-    poll_result = tag.polling(FELICA_SYSTEM_CODE, request_code=1)
+    poll_result = tag.polling(system_code, request_code=1)
     idm, pmm = poll_result[0], poll_result[1]
-    system_code = FELICA_SYSTEM_CODE
+    selected_system = system_code
     if len(poll_result) > 2 and poll_result[2]:
-        system_code = struct.unpack(">H", poll_result[2])[0]
+        selected_system = struct.unpack(">H", poll_result[2])[0]
     tag.idm = idm
     tag.pmm = pmm
-    tag.sys = system_code
-    return idm, pmm, system_code
+    tag.sys = selected_system
+    return idm, pmm, selected_system
 
 
 def describe_error(error: Type3TagCommandError) -> str:
@@ -109,6 +139,22 @@ def describe_error(error: Type3TagCommandError) -> str:
     if errno > 0x00FF:
         return f"card returned status 0x{errno:04X}"
     return f"command failed (errno=0x{errno:02X})"
+
+
+def request_system_codes(tag: Type3Tag) -> List[int]:
+    """Return the list of system codes reported by the tag."""
+    timeout = 0.1  # Conservative timeout that works well in practice.
+    response = tag.send_cmd_recv_rsp(0x0C, bytearray(), timeout, check_status=False)
+    if not response:
+        return []
+    system_count = response[0]
+    expected_length = 1 + system_count * 2
+    if len(response) != expected_length:
+        raise Type3TagCommandError(DATA_SIZE_ERROR)
+    return [
+        struct.unpack(">H", response[i : i + 2])[0]
+        for i in range(1, expected_length, 2)
+    ]
 
 
 def discover_services(tag: Type3Tag) -> List[ServiceInfo]:
@@ -313,12 +359,62 @@ def get_key_version(tag: Type3Tag, service_code: ServiceCode) -> Optional[int]:
     return response[0] if response else None
 
 
-def process_tag(tag: Type3Tag) -> int:
+def process_wildcard(tag: Type3Tag) -> int:
     try:
-        idm, pmm, system_code = select_system(tag)
+        _, _, initial_system = select_system(tag, SYSTEM_CODE_WILDCARD)
     except Type3TagCommandError as exc:
         print(
-            f"Failed to activate system 0x{FELICA_SYSTEM_CODE:04X}: {describe_error(exc)}",
+            f"Failed to activate wildcard system (0xFFFF): {describe_error(exc)}",
+            file=sys.stderr,
+        )
+        return 1
+
+    try:
+        reported_systems = request_system_codes(tag)
+    except Type3TagCommandError as exc:
+        print(
+            f"Failed to request system codes: {describe_error(exc)}",
+            file=sys.stderr,
+        )
+        reported_systems = []
+
+    unique_codes: List[int] = []
+    seen_codes: set[int] = set()
+    for code in [initial_system] + reported_systems:
+        if code == SYSTEM_CODE_WILDCARD:
+            continue
+        if code in seen_codes:
+            continue
+        seen_codes.add(code)
+        unique_codes.append(code)
+
+    if reported_systems:
+        print(f"Card reported {len(reported_systems)} system code(s):")
+        for code in reported_systems:
+            print(f"- 0x{code:04X}")
+    else:
+        print("Card did not report additional system codes (Request System Code returned none).")
+
+    if not unique_codes:
+        print("No systems available to process.")
+        return 0
+
+    overall_result = 0
+    for code in unique_codes:
+        print()
+        print(f"=== Processing system 0x{code:04X} ===")
+        result = process_tag(tag, code)
+        if result != 0:
+            overall_result = result
+    return overall_result
+
+
+def process_tag(tag: Type3Tag, requested_system_code: int) -> int:
+    try:
+        idm, pmm, system_code = select_system(tag, requested_system_code)
+    except Type3TagCommandError as exc:
+        print(
+            f"Failed to activate system 0x{requested_system_code:04X}: {describe_error(exc)}",
             file=sys.stderr,
         )
         return 1
@@ -399,9 +495,15 @@ def main() -> int:
         print(f"Unable to open NFC device '{args.device}': {exc}", file=sys.stderr)
         return 1
 
-    print(f"Waiting for FeliCa card (system code 0x{FELICA_SYSTEM_CODE:04X})...")
+    if args.system_code == SYSTEM_CODE_WILDCARD:
+        wait_label = "system code 0xFFFF (wildcard)"
+    else:
+        wait_label = f"system code 0x{args.system_code:04X}"
+    print(f"Waiting for FeliCa card ({wait_label})...")
     with clf:
-        target = wait_for_felica_target(clf, args.poll_tries, args.poll_interval)
+        target = wait_for_felica_target(
+            clf, args.poll_tries, args.poll_interval, args.system_code
+        )
         if target is None:
             print("No FeliCa card detected.")
             return 1
@@ -417,7 +519,9 @@ def main() -> int:
             return 1
 
         try:
-            return process_tag(tag)
+            if args.system_code == SYSTEM_CODE_WILDCARD:
+                return process_wildcard(tag)
+            return process_tag(tag, args.system_code)
         finally:
             closer = getattr(tag, "close", None)
             if callable(closer):
